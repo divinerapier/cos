@@ -1,0 +1,16 @@
+[package]
+name = "cos"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hyper = {version =  "0.14", features  = ["full"]}
+hyper-rustls = { version = "0.22", features = ["rustls-native-certs"]}
+reqwest = "0.11"
+anyhow = "1"
+hmac-sha1 = "0.1"
+hex = "0.4.3"
+chrono = "0.4"
+urlencoding = "2"
