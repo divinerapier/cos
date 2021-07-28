@@ -8,9 +8,12 @@ edition = "2018"
 [dependencies]
 hyper = {version =  "0.14", features  = ["full"]}
 hyper-rustls = { version = "0.22", features = ["rustls-native-certs"]}
+tokio = {version = "1", features = ["full"]}
 reqwest = "0.11"
 anyhow = "1"
 hmac-sha1 = "0.1"
 hex = "0.4.3"
 chrono = "0.4"
 urlencoding = "2"
+form_urlencoded = "1"
+openssl = "*"
