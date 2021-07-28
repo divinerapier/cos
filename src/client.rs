@@ -30,22 +30,33 @@ impl AuthorizationComputer {
     fn authorazation(
         secret_id: &str,
         secret_key: &str,
-        uri: &str,
+        method: &str,
+        path: &str,
         auth_time: AuthTime,
         headers: &HeaderMap,
         queries: Parse,
     ) -> Result<String> {
         let sign_time = auth_time.sign();
         let key_time = auth_time.key();
-        let sign_key = Self::calc_sign_key(secret_id, &key_time);
+        let sign_key = Self::calc_sign_key(secret_key, &key_time);
         let (format_headers, signed_header_list) = Self::gen_format_headers(headers)?;
         let (format_parameters, signed_parameter_list) = Self::gen_format_parameters(queries)?;
         let format_string = format!(
             "{}\n{}\n{}\n{}\n",
-            "get", uri, &format_parameters, &format_headers
+            method, path, &format_parameters, &format_headers
         );
         let string_to_sign = Self::cal_string_to_sign("sha1", &key_time, &format_string);
         let signature = Self::cal_signature(sign_key.as_bytes(), string_to_sign.as_bytes());
+
+        println!("format_string: {}", format_string);
+        println!("string_to_sign: {}", string_to_sign);
+
+        println!("secret_id: {}", secret_id);
+        println!("sign_time: {}", sign_time);
+        println!("key_time: {}", key_time);
+        println!("signed_header_list: {}", signed_header_list.join(";"));
+        println!("signed_parameter_list: {}", signed_parameter_list.join(";"));
+        println!("signature: {}", signature);
 
         let auth = format! (       "q-sign-algorithm={}&q-ak={}&q-sign-time={}&q-key-time={}&q-header-list={}&q-url-param-list={}&q-signature={}" , "sha1",
   secret_id,
@@ -65,7 +76,13 @@ signature);
     }
 
     fn cal_signature(sign_key: &[u8], string_to_sign: &[u8]) -> String {
+        println!(
+            "cal signature:\nkey: {}\nvalue: {}\n",
+            unsafe { String::from_utf8_unchecked(Vec::from(sign_key)) },
+            unsafe { String::from_utf8_unchecked(Vec::from(string_to_sign)) },
+        );
         let result = hmacsha1::hmac_sha1(sign_key, string_to_sign);
+        println!("digest: {:?}\n\n", result);
         hex::encode(&result)
     }
 
@@ -243,6 +260,7 @@ impl ClientImpl {
         &self,
         begin_timestamp: i64,
         expire_in_second: i64,
+        method: &str,
         uri: &str,
         headers: &HeaderMap,
         queries: Parse,
@@ -252,7 +270,8 @@ impl ClientImpl {
 
         let auth_time = AuthTime::new(begin_timestamp, expire_in_second);
 
-        AuthorizationComputer::authorazation(ak, sk, uri, auth_time, headers, queries).unwrap()
+        AuthorizationComputer::authorazation(ak, sk, method, uri, auth_time, headers, queries)
+            .unwrap()
     }
 
     pub async fn get<U: IntoUrl>(&self, url: U) -> Result<reqwest::Response> {
@@ -262,7 +281,7 @@ impl ClientImpl {
         let builder = self.inner.get(url);
         let mut request = builder.build()?;
         let queries = request.url().query_pairs();
-        let auth = self.auth(now, expire, &url_str, request.headers(), queries);
+        let auth = self.auth(now, expire, "get", &url_str, request.headers(), queries);
         request
             .headers_mut()
             .insert(AUTHORIZATION, HeaderValue::from_str(&auth)?)
@@ -339,13 +358,13 @@ pub struct BucketService {
     client: Arc<ClientImpl>,
 }
 
-pub struct BucketGetOptions {
-    prefix: String,
-    delimiter: String,
-    encoding_type: String,
-    marker: String,
-    max_keys: String,
-}
+// pub struct BucketGetOptions {
+//     prefix: String,
+//     delimiter: String,
+//     encoding_type: String,
+//     marker: String,
+//     max_keys: String,
+// }
 
 impl BucketService {
     pub async fn get(&self) -> reqwest::Response {
@@ -492,10 +511,11 @@ mod test {
         let host = "testbucket-125000000.cos.ap-guangzhou.myqcloud.com";
         let uri = "http://testbucket-125000000.cos.ap-guangzhou.myqcloud.com/testfile2";
         let client = reqwest::Client::builder().build().unwrap();
-        let req = client.get(uri).build().unwrap();
+        let req = client.put(uri).build().unwrap();
         let parse = req.url().query_pairs();
         let start_time = 1480932292;
         let end_time = 1481012292;
+        let path = req.url().path();
         let mut headers = HeaderMap::new();
         headers.insert("Host", HeaderValue::from_str(host).unwrap());
         headers.insert(
@@ -503,11 +523,13 @@ mod test {
             HeaderValue::from_static("db8ac1c259eb89d4a131b253bacfca5f319d54f2"),
         );
         headers.insert("x-cos-stroage-class", HeaderValue::from_static("nearline"));
+        println!("method: {}", req.method().as_str().to_lowercase());
         let auth_time = AuthTime::new(start_time, end_time - start_time);
         let actual = AuthorizationComputer::authorazation(
             &secret_id,
             &secret_key,
-            &uri,
+            &req.method().as_str().to_lowercase(),
+            &path,
             auth_time,
             &headers,
             parse,
