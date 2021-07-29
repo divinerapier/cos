@@ -1,15 +1,47 @@
-use std::{collections::HashMap, fmt::Debug, fs::OpenOptions, ops::Index, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use form_urlencoded::Parse;
 use hyper::{
-    client::connect::Connect,
     header::{HeaderValue, AUTHORIZATION},
-    HeaderMap, Request, Response, Uri,
+    HeaderMap,
 };
-use openssl::string;
-use reqwest::IntoUrl;
+use reqwest::Body;
 
 use anyhow::Result;
+
+lazy_static::lazy_static! {
+    static ref SIGN_HEADERS: HashMap< &'static str, bool> = {
+        let mut m = HashMap::new();
+        m.insert("host", true);
+        m.insert("range", true);
+        m.insert("x-cos-acl", true);
+        m.insert("x-cos-grant-read", true);
+        m.insert("x-cos-grant-write", true);
+        m.insert("x-cos-grant-full-control", true);
+        m.insert("response-content-type", true);
+        m.insert("response-content-language", true);
+        m.insert("response-expires", true);
+        m.insert("response-cache-control", true);
+        m.insert("response-content-disposition", true);
+        m.insert("response-content-encoding", true);
+        m.insert("cache-control", true);
+        m.insert("content-disposition", true);
+        m.insert("content-encoding", true);
+        m.insert("content-type", true);
+        m.insert("content-length", true);
+        m.insert("content-md5", true);
+        m.insert("expect", true);
+        m.insert("expires", true);
+        m.insert("x-cos-content-sha1", true);
+        m.insert("x-cos-storage-class", true);
+        m.insert("if-modified-since", true);
+        m.insert("origin", true);
+        m.insert("access-control-request-method", true);
+        m.insert("access-control-request-headers", true);
+        m.insert("x-cos-object-type", true);
+        m
+    };
+}
 
 pub struct Client {
     inner: Arc<ClientImpl>,
@@ -58,13 +90,17 @@ impl AuthorizationComputer {
         println!("signed_parameter_list: {}", signed_parameter_list.join(";"));
         println!("signature: {}", signature);
 
-        let auth = format! (       "q-sign-algorithm={}&q-ak={}&q-sign-time={}&q-key-time={}&q-header-list={}&q-url-param-list={}&q-signature={}" , "sha1",
-  secret_id,
-  sign_time,
-key_time,
-signed_header_list.join(";"),
-signed_parameter_list.join(";"),
-signature);
+        let auth = [
+            format!("q-sign-algorithm={}", "sha1"),
+            format!("q-ak={}", secret_id),
+            format!("q-sign-time={}", sign_time),
+            format!("q-key-time={}", key_time),
+            format!("q-header-list={}", signed_header_list.join(";")),
+            format!("q-url-param-list={}", signed_parameter_list.join(";")),
+            format!("q-signature={}", signature),
+        ]
+        .join("&");
+
         Ok(auth)
     }
 
@@ -92,12 +128,7 @@ signature);
     }
 
     fn ishex(c: char) -> bool {
-        match c {
-            '0'..='9' => true,
-            'a'..='f' => true,
-            'A'..='F' => true,
-            _ => false,
-        }
+        matches!(c, '0'..='9'|'a'..='f'|'A'..='F')
     }
 
     fn is_valid_query(s: &str) -> bool {
@@ -139,7 +170,6 @@ signature);
             if let Some(values) = kv_pairs.get_mut(key) {
                 values.sort();
                 for value in values {
-                    // TODO:
                     header_list.push(format!(
                         "{}={}",
                         crate::urlencoding::safe_url_encode(key),
@@ -176,7 +206,6 @@ signature);
             if let Some(values) = kv_pairs.get_mut(key) {
                 values.sort();
                 for value in values {
-                    // TODO:
                     header_list.push(format!(
                         "{}={}",
                         crate::urlencoding::safe_url_encode(key),
@@ -274,18 +303,50 @@ impl ClientImpl {
             .unwrap()
     }
 
-    pub async fn get<U: IntoUrl>(&self, url: U) -> Result<reqwest::Response> {
+    pub async fn get(&self, url: &str, path: &str) -> Result<reqwest::Response> {
         let now = chrono::Local::now().timestamp();
         let expire = 180 * 24 * 3600;
-        let url_str = url.as_str().to_string();
+        // let url_str = url.as_str().to_string();
         let builder = self.inner.get(url);
         let mut request = builder.build()?;
         let queries = request.url().query_pairs();
-        let auth = self.auth(now, expire, "get", &url_str, request.headers(), queries);
+        let auth = self.auth(now, expire, "get", path, request.headers(), queries);
         request
             .headers_mut()
-            .insert(AUTHORIZATION, HeaderValue::from_str(&auth)?)
-            .unwrap();
+            .insert(AUTHORIZATION, HeaderValue::from_str(&auth)?);
+        Ok(self.inner.execute(request).await?)
+    }
+
+    pub async fn put<T: Into<Body> + AsRef<[u8]>>(
+        &self,
+        url: &str,
+        path: &str,
+        body: T,
+    ) -> Result<reqwest::Response> {
+        let now = chrono::Local::now().timestamp();
+        let expire = 180 * 24 * 3600;
+        let content_md5 = {
+            use openssl::hash::{Hasher, MessageDigest};
+            let mut h = Hasher::new(MessageDigest::md5()).unwrap();
+            h.update(body.as_ref()).unwrap();
+            h.finish().unwrap()
+        };
+        let builder = self.inner.put(url).body(body);
+        let mut request = builder.build()?;
+        let queries = request.url().query_pairs();
+        let auth = self.auth(now, expire, "put", path, request.headers(), queries);
+
+        request.headers_mut().insert(
+            "x-cos-meta-md5",
+            HeaderValue::from_str(&hex::encode(content_md5))?,
+        );
+        request.headers_mut().insert(
+            "Content-MD5",
+            HeaderValue::from_str(&base64::encode(content_md5))?,
+        );
+        request
+            .headers_mut()
+            .insert(AUTHORIZATION, HeaderValue::from_str(&auth)?);
         Ok(self.inner.execute(request).await?)
     }
 }
@@ -352,6 +413,47 @@ impl Client {
             client: self.inner.clone(),
         }
     }
+
+    pub fn object(&self) -> ObjectService {
+        ObjectService {
+            client: self.inner.clone(),
+        }
+    }
+}
+
+pub struct ObjectService {
+    client: Arc<ClientImpl>,
+}
+
+impl ObjectService {
+    pub async fn get(&self, key: &str) -> String {
+        let client = &self.client;
+        let url = format!(
+            "{}/{}",
+            client.bucket_url,
+            crate::urlencoding::encode_uri_component(key, None)
+        );
+        println!("url: {}", url);
+        let response = client.get(&url, &["/", key].concat()).await.unwrap();
+        let text = response.text().await.unwrap();
+        println!("text: {}", text);
+        text
+    }
+
+    pub async fn put<T: Into<Body> + AsRef<[u8]>>(&self, key: &str, body: T) -> String {
+        let client = &self.client;
+        let url = format!(
+            "{}/{}",
+            client.bucket_url,
+            crate::urlencoding::encode_uri_component(key, None)
+        );
+        println!("url: {}", url);
+        let response = client.put(&url, &["/", key].concat(), body).await.unwrap();
+        println!("response header: {:?}", response.headers());
+        let text = response.text().await.unwrap();
+        println!("text: {}", text);
+        text
+    }
 }
 
 pub struct BucketService {
@@ -369,20 +471,176 @@ pub struct BucketService {
 impl BucketService {
     pub async fn get(&self) -> reqwest::Response {
         let client = self.client.clone();
-        let now = chrono::Local::now().timestamp();
-        // client.auth(now, 180 * 30 * 3600, headers);
         let builder = client.inner.get("https://www.baidu.com");
         let request = builder.build().unwrap();
         client.inner.execute(request).await.unwrap()
-        // builder.send().await.unwrap()
     }
 }
 
 #[cfg(test)]
 mod test {
-    use hyper::http::request;
-
     use super::*;
+
+    #[test]
+    fn test_md5() {
+        use openssl::hash::{Hasher, MessageDigest};
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "AJ37vFp7YflTu5cPRPBJCkE4qStC5XBgCF1AqKVJqy6yI5GVlyPL55FFYpgLn8Lx",
+                "ac4dc71459982db5d8521f704615bc35",
+            ),
+            (
+                "CLiEtMFnqWQU3Iu7vsQJnJ5fMyRVlF6yMT1uoAJmvWOGloP/VImagaFDOboHm+Dg",
+                "fe770a7a9c74bb6505692f441298b8c2",
+            ),
+            (
+                "Pg7tJEhvnXWecNezz8Gow4hYiVCid84+WClek/MgNGA/S32eduW4s45hn5UWxO1n",
+                "b751654beea40f935f8cac6dd468e0fc",
+            ),
+            (
+                "TH8TUzrt3RdpfxprKm3/HTqx05sbIZE0Yklsaqu+EluNkDZD4xjfgFr2Bvyg5r27",
+                "de54d414abb864ccb9ca32ff0505e55e",
+            ),
+            (
+                "vYa9xK+fuqof0T6aN0iQIHANBZy/hH9UiW2LD36fmW0c3IHhv3bBHuRxRDYBdgD1",
+                "705cd6de2a3b803dcc3d94ee5eb15b43",
+            ),
+            (
+                "4qCgl+6/+hUTzxmoS2frIBW9V5P54vARKwhO12HIpu2eP9Xk04zXUkyddLMLICvu",
+                "a75d69c6fbafe228360c6479bab7c2ed",
+            ),
+            (
+                "eqbhHzsVduc0cALT5pSOLfrxeDg0HOUbuyFnyoX7fYf/tFpOs8vBSj7UrLFxtQza",
+                "3aeb99396244c17b2e7dcee7be946cb7",
+            ),
+            (
+                "aT9MuXWmzzeZGGw/p3Y4WHthJMoQ0S1N+vBBXyteF+RJTwFBE1b/oG+fqHCCNe15",
+                "f0c401d1151fadec2d6dbf1bb8191ca7",
+            ),
+            (
+                "tfkIR1MsZ/fh+wb02IqBUpSXWx9WrUxr967inu3GZCJLNn9kqgrej484qpfp3xSr",
+                "5139c0d4799a848e11cfdcd07a112cee",
+            ),
+            (
+                "doT2cHiLeEQJ4ray3RLPQHsjAS2LRgREou/OTZI7YrQi0zg1jp53bg2jrDxK6ult",
+                "b516229701ecfdba5f6da6cb57275824",
+            ),
+            (
+                "U74cPGrFg8ybDHxxDCiDOv8kjBtIUe2Pr/u3v802qdzlce9sV79iAHU1K4uK7MWO",
+                "fc6419e8fbae233613c530a8a6330adb",
+            ),
+            (
+                "/WDnZNu/Qzu7xEMMAgH7f9QkEy0cUKrwUrxXeAezpxkU+hI2ZfCbTs81vdRIA54l",
+                "05c0bd010f635578d81030dc9d48515b",
+            ),
+            (
+                "rTkjsuOHXVMAYqVwiT3halOsn+UfU02LsidNAXXLBmWO/aMcSVvBAya/hLSh2CPe",
+                "883a46be6affff4c5a26504aa4a5e0ae",
+            ),
+            (
+                "Pwg3l1KFjbsoprmi5cl3+I/iCUh6SuXGym1Mjlz/c5yQK/0AquuC2mKdRJ25ce+z",
+                "713dcb88f00ebb5e803b6ff26c5e4e41",
+            ),
+            (
+                "c7yym/+Q8iwWGrU60+AgpaB5FzgonWQ7OCAmtI8ZELouXdiEXu/85AxEL7oRmXE/",
+                "5349c89aa7986138fb26a46f4cf0c77a",
+            ),
+            (
+                "v7ZsO1spbsy0jkUPEFpRCnootE3XB/raX1wYBCaWJWGEvXws16lxV7iq+FPYs0pU",
+                "63d371f791642965d08fd8423890b1f9",
+            ),
+        ];
+        let mut h = Hasher::new(MessageDigest::md5()).unwrap();
+        for case in cases {
+            h.update(case.0.as_bytes()).unwrap();
+            let result = hex::encode(h.finish().unwrap());
+            println!("{}", result);
+            assert_eq!(result, case.1);
+        }
+    }
+
+    #[test]
+    fn test_crc64() {
+        let _ecma: crc::Crc<_> = crc::Crc::<u64>::new(&crc::CRC_64_ECMA_182);
+        let _cases: Vec<(&str, u64)> = vec![
+            ("hello world", 5981764153023615706),
+            (
+                "6u+xqlgzGU6innFnMLDkgH114ONmkLSSbKA3DFZwPuyyQmuvVikXefCulnAAIqw2",
+                14572412854704403212,
+            ),
+            (
+                "oY0EroZoA4BMKDX+g4Dl5mYxT/vI37kIZ7gG2dmSPNgzk7kKvY/cFm+Suw+3/cCc",
+                5164735488784417736,
+            ),
+            (
+                "Y/SaFhKcxFHtl1V+aPraQPJaHDBlbOqScYtM++Ax8Hmw2VSrAl5rXvk27bd97md7",
+                17244667989215551457,
+            ),
+            (
+                "2tA/hj2iiS8FnU2cHangy02TKAEl+W74fSmOCjUwTcax+L9jr6+F94N/E9GfDIkb",
+                18004985755321710523,
+            ),
+            (
+                "JEke7ovDJBOX47XJQtKBDLQ9GRem5yUc5c27w1baK4mPKm0IlB8WUbZcuymD4lzY",
+                10017151388654735929,
+            ),
+            (
+                "YxSfuCzNyHv7sWlSUwP4114QcEYMAn4YbogHvMGpyTjHIkrWZd87yPx91vaduSMo",
+                15132840424691900123,
+            ),
+            (
+                "G80JZKRIqJZC3J7kkMp68BQZ8cxY/GxffWc44yg+mMFHhe8va5BVuRE7Lv06zQTg",
+                6198368208398009937,
+            ),
+            (
+                "lMm/+eTp+m00iC0Z7kt1SY5TCps6ASmUWCyJMRvxm/Wnn0jNHSxh/5aSz+StTrmD",
+                13093119539118966429,
+            ),
+            (
+                "wqYVg80ziXeFrq0iFtAW/i0a+rXhipRVaj57GIPIcXvlkcbIJDDaSU+4L4Etknem",
+                14019831132253083013,
+            ),
+            (
+                "effPLl5tyQgPgK5rTlRLlDIuajWm75CKF8HF7V3It8Qh2ic+YNgkj6WyytTXRAK3",
+                11901856423799743978,
+            ),
+            (
+                "6x0ahIlUs25TulQY/BweZX8CXISYLqapGIpYPOMkk1GsA0bz2M5W3ZNh0uUQldJn",
+                7240874481603246853,
+            ),
+            (
+                "llxCS2HZzvcxLcJIxeNiAmlIuHrci4F3KnDgWg0maftDBdGZgpmjdSDwitS8xXBg",
+                5112180515127266155,
+            ),
+            (
+                "u1a1usGI5bhXd8UApjtXKYhWdv3XOMwxf/AvuV14dZoYNFCTBsjqiOb6w+wS3rEg",
+                8991569294952157660,
+            ),
+            (
+                "RVKFutUYf/Lmyf9GIdaE23UbAO27rL92Uk5mZiM96BHAddhpK/TRqY4xHwZYrq0a",
+                6744385118952109351,
+            ),
+            (
+                "uj0InFhZN75mRsZc3upNb6N0iRDQqXDQkvlOFDRpCn8iFyHJJrNSTMyOAw+HFCrZ",
+                18286972960748437890,
+            ),
+            (
+                "FiF4FTN8BG7zxUf9nOVwIEoX4HdtnfsctkHOIvWOmOkccqQjDt47g9am1nBEuL2v",
+                15436735472894984101,
+            ),
+        ];
+        // for case in cases {
+        //     let mut digest = ecma.digest();
+        //     digest.update(case.0.as_bytes());
+        //     // assert_eq!(digest.finalize(), case.1);
+        // }
+        // println!("{}", ecma.checksum(b"hello world"));
+        // println!("{}", ecma.checksum(b"hello world"));
+        // println!("{}", ecma.checksum(b"hello world"));
+        // println!("{}", ecma.checksum(b"hello world"));
+        println!("{}", crc64::crc64(0, b"hello world"));
+    }
+
     #[test]
     fn test_cal_sign_key() {
         let cases = vec![
@@ -445,6 +703,26 @@ mod test {
             println!("{} -> {}", k, v);
         }
         // let _a = client.execute(request).await.unwrap();
+    }
+
+    #[test]
+    fn test_hex() {
+        for c in '0'..='9' {
+            assert!(AuthorizationComputer::ishex(c));
+        }
+        for c in 'A'..='F' {
+            assert!(AuthorizationComputer::ishex(c));
+        }
+        for c in 'a'..='f' {
+            assert!(AuthorizationComputer::ishex(c));
+        }
+
+        assert!(!AuthorizationComputer::ishex('!'));
+        assert!(!AuthorizationComputer::ishex('%'));
+        assert!(!AuthorizationComputer::ishex('g'));
+        assert!(!AuthorizationComputer::ishex('G'));
+        assert!(!AuthorizationComputer::ishex('z'));
+        assert!(!AuthorizationComputer::ishex('Z'));
     }
 
     #[test]
@@ -537,5 +815,32 @@ mod test {
         .unwrap();
 
         assert_eq!(expect_authorization, actual);
+    }
+
+    #[tokio::test]
+    async fn test_get_object() {
+        let client = Builder::new()
+            .set_access_key("")
+            .set_secret_key("")
+            .set_region("")
+            .set_bucket("")
+            .build()
+            .unwrap();
+
+        let text = client.object().get("path1/1.txt").await;
+        assert_eq!("sdasd", text);
+    }
+
+    #[tokio::test]
+    async fn test_put_object() {
+        let client = Builder::new()
+            .set_access_key("")
+            .set_secret_key("")
+            .set_region("")
+            .set_bucket("")
+            .build()
+            .unwrap();
+
+        let _text = client.object().put("path/1/6.txt", "hello world").await;
     }
 }
