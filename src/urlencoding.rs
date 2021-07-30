@@ -62,7 +62,7 @@ mod test {
         ];
         for c in cases {
             let result = encode_uri_component(c.0, None);
-            println!("{} -> {} -> {}", c.0, result, c.1);
+            log::debug!("{} -> {} -> {}", c.0, result, c.1);
             assert_eq!(result, c.1);
         }
     }
@@ -82,7 +82,7 @@ mod test {
         let exclude: Vec<u8> = vec!['/' as u8];
         for c in cases {
             let result = encode_uri_component(c.0, Some(&exclude));
-            println!("{} -> {} -> {}", c.0, result, c.1);
+            log::debug!("{} -> {} -> {}", c.0, result, c.1);
             assert_eq!(result, c.1);
         }
     }
